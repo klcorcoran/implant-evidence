@@ -1,1 +1,24 @@
+name: harvest-and-update
+on:
+  schedule:
+    - cron: "20 09 * * *"   # runs daily at 09:20 UTC (change if you want)
+  workflow_dispatch: {}     # lets you click "Run workflow" manually
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python harvester.py
+      - name: Commit CSV updates
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add evidence_cards.csv evidence_studies.csv || true
+          git commit -m "auto: refresh evidence CSVs" || echo "no changes"
+          git push
 
