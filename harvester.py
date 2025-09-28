@@ -4,7 +4,7 @@
 import csv, datetime, requests, sys
 from urllib.parse import urlencode
 
-EMAIL = "your_email@example.com"  # used for Unpaywall & good API etiquette
+EMAIL = "kam.l.corcoran@gmail.com"  # used for Unpaywall & good API etiquette
 
 # --- Helper calls ---
 
