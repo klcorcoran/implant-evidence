@@ -12,10 +12,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
+        with:
+          python-version: '3.11'
+
+      # Install what the script needs
       - run: pip install requests
+
+      # Run your script
       - run: python harvester.py
+
+      # Fix for "detected dubious ownership" (rare, but harmless to include)
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Commit + push the CSVs produced by harvester.py
       - name: Commit CSV updates
         run: |
           git config user.name "github-actions"
