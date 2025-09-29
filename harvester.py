@@ -1,19 +1,22 @@
-# harvester.py — multi-card (stemless + metal-backed)
-import csv, datetime, requests
+# harvester.py — config-driven evidence harvester (PubMed + OpenAlex + Crossref + Unpaywall)
+import csv, datetime, time, requests, sys, os
 
-EMAIL = "kam.l.corcoran@gmail.com"   # Unpaywall needs a real email
+EMAIL = os.getenv("HARVESTER_CONTACT_EMAIL", "your_email@example.com")  # set to a real email for Unpaywall
+OPENALEX_SINCE = os.getenv("OPENALEX_SINCE", "2018-01-01")
+PUBMED_RETMAX = int(os.getenv("PUBMED_RETMAX", "50"))
+USER_AGENT = "implant-evidence-harvester/1.0 (+https://example.com; contact=" + EMAIL + ")"
 
-# ---- HTTP helper ---------------------------------------------------------
+HEADERS = {"User-Agent": USER_AGENT}
+
 def safe_get(url, params=None, timeout=30):
     try:
-        r = requests.get(url, params=params, timeout=timeout)
+        r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
         r.raise_for_status()
         return r
     except Exception as e:
-        print(f"[warn] GET failed: {url}  ({e})")
+        print(f"[warn] GET failed: {url} ({e})")
         return None
 
-# ---- APIs ----------------------------------------------------------------
 def pubmed_search(term, retmax=50):
     r = safe_get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                  {"db":"pubmed","term":term,"retmode":"json","retmax":retmax})
@@ -32,10 +35,13 @@ def pubmed_summary(pmids):
         for a in rec.get("articleids",[]):
             if a.get("idtype")=="doi":
                 doi = a.get("value",""); break
+        year = ""
+        pubdate = rec.get("pubdate","")
+        if pubdate: year = pubdate[:4]
         out.append({
             "pmid": pid,
             "title": rec.get("title",""),
-            "year": (rec.get("pubdate","")[:4] or ""),
+            "year": year,
             "doi": doi,
             "link": f"https://pubmed.ncbi.nlm.nih.gov/{pid}/"
         })
@@ -46,11 +52,12 @@ def openalex_reviews(query, since="2018-01-01", per_page=25):
                  {"search": query, "filter": f"type:review,from_publication_date:{since}", "per_page": per_page})
     if not r: return []
     out=[]
-    for w in r.json().get("results",[]):
+    j = r.json()
+    for w in j.get("results",[]):
         doi = (w.get("doi") or "").replace("https://doi.org/","")
         out.append({
             "title": w.get("title",""),
-            "year": str(w.get("publication_year","")),
+            "year": str(w.get("publication_year","") or ""),
             "doi": doi,
             "link": (f"https://doi.org/{doi}" if doi else (w.get("id","") or ""))
         })
@@ -61,28 +68,24 @@ def crossref_enrich(doi):
     r = safe_get(f"https://api.crossref.org/works/{doi}", timeout=20)
     if not r: return {}
     m = r.json().get("message",{})
-    funders = [f.get("name") for f in m.get("funder",[])]
-    licenses = [l.get("URL") for l in m.get("license",[])]
+    funders = [f.get("name") for f in m.get("funder",[]) if f.get("name")]
+    licenses = [l.get("URL") for l in m.get("license",[]) if l.get("URL")]
     return {"funding": "; ".join(funders) if funders else "", "license_url": (licenses[0] if licenses else "")}
 
 def unpaywall_pdf(doi, email):
     if not doi: return ""
-    r = safe_get(f"https://api.unpaywall.org/v2/{doi}?email={email}", timeout=20)
+    r = safe_get(f"https://api.unpaywall.org/v2/{doi}", params={"email": email}, timeout=20)
     if not r: return ""
     data = r.json()
     best = data.get("best_oa_location") or {}
     return best.get("url_for_pdf","") or best.get("url","") or ""
 
-# ---- rows + builder ------------------------------------------------------
-today = datetime.date.today().isoformat()
-studies_rows, cards_rows, seen = [], [], set()
-
-def add_row(card_id, study_type, title, year, doi, link, note):
-    key = (doi or "", link or "", title or "")
+def add_study_row(studies_rows, seen, card_id, study_type, title, year, doi, link, note, email):
+    key = (doi or "", link or "", title or "", study_type or "", card_id or "")
     if key in seen: return
     seen.add(key)
     enrich = crossref_enrich(doi)
-    pdf = unpaywall_pdf(doi, EMAIL) if doi else ""
+    pdf = unpaywall_pdf(doi, email) if doi else ""
     studies_rows.append({
         "card_id": card_id,
         "study_id": f"doi:{doi}" if doi else f"url:{link}",
@@ -101,103 +104,74 @@ def add_row(card_id, study_type, title, year, doi, link, note):
         "risk_of_bias_tool": "",
         "risk_of_bias_overall": "",
         "source_api": "PubMed/OpenAlex/Crossref/Unpaywall",
-        "notes": note,
+        "notes": note or "",
         "oa_pdf": pdf
     })
 
-def build_card(feature_name, outcome, comparator, pubmed_query, openalex_query, card_id,
-               bottom_line, certainty, registry_njr, registry_aoanjrr, registry_ajrr):
-    # search & collect
-    pmids = pubmed_search(pubmed_query, retmax=50)
+def build_card(cards_rows, studies_rows, seen, cfg_row):
+    pmids = pubmed_search(cfg_row["pubmed_query"], retmax=PUBMED_RETMAX)
     pm = pubmed_summary(pmids)
-    oa = openalex_reviews(openalex_query, since="2018-01-01")
+    oa = openalex_reviews(cfg_row["openalex_query"], since=OPENALEX_SINCE)
 
+    card_id = cfg_row["card_id"]
     for r in oa:
-        add_row(card_id, "systematic_review_or_meta_analysis", r["title"], r["year"], r["doi"], r["link"],
-                "SR/MA candidate (PRISMA/AMSTAR-2 to assess).")
+        add_study_row(studies_rows, seen, card_id, "systematic_review_or_meta_analysis",
+                      r["title"], r["year"], r["doi"], r["link"],
+                      "SR/MA candidate (screen with PRISMA/AMSTAR-2).", EMAIL)
     for s in pm:
-        add_row(card_id, "primary_study", s["title"], s["year"], s["doi"], s["link"],
-                "Candidate RCT/cohort; classify later (RoB 2 / ROBINS-I).")
+        add_study_row(studies_rows, seen, card_id, "primary_study",
+                      s["title"], s["year"], s["doi"], s["link"],
+                      "Candidate RCT/cohort; classify later (RoB 2 / ROBINS-I).", EMAIL)
 
     cards_rows.append({
         "card_id": card_id,
         "entity_type": "feature",
-        "entity_name": feature_name,
-        "outcome": outcome,
-        "comparator": comparator,
-        "bottom_line": bottom_line,
-        "certainty": certainty,
-        "registry_njr": registry_njr,
-        "registry_aoanjrr": registry_aoanjrr,
-        "registry_ajrr": registry_ajrr,
-        "last_updated": today,
+        "entity_name": cfg_row["feature_name"],
+        "outcome": cfg_row["outcome"],
+        "comparator": cfg_row["comparator"],
+        "bottom_line": cfg_row["bottom_line"],
+        "certainty": cfg_row["certainty"],
+        "registry_njr": cfg_row["registry_njr"],
+        "registry_aoanjrr": cfg_row["registry_aoanjrr"],
+        "registry_ajrr": cfg_row["registry_ajrr"],
+        "last_updated": datetime.date.today().isoformat(),
         "tags": "shoulder;TSA"
     })
 
-# ---- CARD 1: Stemless humeral component (existing) -----------------------
-build_card(
-    feature_name="Stemless humeral component (aTSA)",
-    outcome="5yr_all_cause_revision",
-    comparator="Stemmed aTSA",
-    pubmed_query='(stemless[Title/Abstract]) AND ("total shoulder arthroplasty"[Title/Abstract]) AND (revision OR survivorship)',
-    openalex_query='stemless anatomic total shoulder arthroplasty revision',
-    card_id="card_stemless_any_5yr",
-    bottom_line="Across SR/MA, one RCT, and adjusted registry analyses, stemless shows ~comparable 5-yr revision vs stemmed; signals confounded when metal-backed glenoids are included.",
-    certainty="moderate",
-    registry_njr="limited shoulder coverage",
-    registry_aoanjrr="Comparable stemless vs stemmed after excluding metal-backed glenoids.",
-    registry_ajrr="Survivorship broadly comparable; see Annual Report."
-)
+def main():
+    cfg_path = "cards_config.csv"
+    if not os.path.exists(cfg_path):
+        print("Missing cards_config.csv in repo root. Create it and rerun."); sys.exit(1)
 
-# ---- CARD 2: Metal-backed glenoid (aTSA) ---------------------------------
-build_card(
-    feature_name="Metal-backed glenoid (aTSA)",
-    outcome="5yr_all_cause_revision",
-    comparator="Cemented all-polyethylene glenoid (aTSA)",
-    pubmed_query='(("metal-backed"[Title/Abstract]) OR ("metal backed"[Title/Abstract]) OR ("trabecular metal"[Title/Abstract])) AND (("total shoulder arthroplasty"[Title/Abstract]) OR ("anatomic shoulder arthroplasty"[Title/Abstract])) AND (revision OR survivorship OR failure) NOT (reverse[Title/Abstract])',
-    openalex_query='metal-backed glenoid anatomic total shoulder arthroplasty revision',
-    card_id="card_metalbacked_any_5yr",
-    bottom_line="SR/MA and registries show higher revision/failure with metal-backed glenoids vs cemented all-poly in aTSA; mid-term RCTs of modern MBG show no clear superiority. Prefer cemented all-poly for routine aTSA; use MBG with caution.",
-    certainty="moderate",
-    registry_njr="limited shoulder reporting",
-    registry_aoanjrr="Registry collaboration shows higher revision when MBG used; excluding MBG equalizes stemless vs stemmed.",
-    registry_ajrr="Narrative caution around MBG in annual reports; confirm per latest edition."
-)
+    cards_rows, studies_rows, seen = [], [], set()
 
-# ---- CARD 3: Cemented all-polyethylene glenoid (aTSA) --------------------
-build_card(
-    feature_name="Cemented all-polyethylene glenoid (aTSA)",
-    outcome="5yr_all_cause_revision",
-    comparator="Metal-backed glenoid (aTSA)",
-    pubmed_query=(
-        '(("all polyethylene"[Title/Abstract]) OR ("all-polyethylene"[Title/Abstract]) '
-        'OR ("polyethylene glenoid"[Title/Abstract])) AND '
-        '(("total shoulder arthroplasty"[Title/Abstract]) OR ("anatomic shoulder arthroplasty"[Title/Abstract])) '
-        'AND (revision OR survivorship OR failure) NOT (reverse[Title/Abstract])'
-    ),
-    openalex_query='all polyethylene glenoid anatomic total shoulder arthroplasty revision',
-    card_id="card_allpoly_any_5yr",
-    bottom_line=(
-        "Cemented all-poly glenoids remain the reference option for aTSA with favorable mid-term survivorship. "
-        "Multiple SR/registry analyses report higher revision/failure with metal-backed glenoids; "
-        "modern TM-backed RCTs show no superiority at 5 years. Prefer cemented all-poly for routine aTSA."
-    ),
-    certainty="moderate",
-    registry_njr="limited shoulder reporting",
-    registry_aoanjrr="Registry collaboration indicates higher revision when metal-backed glenoids are used; all-poly performs best.",
-    registry_ajrr="Annual report narratives caution on MBG; all-poly cemented widely used."
-)
+    with open(cfg_path, newline="", encoding="utf-8") as cf:
+        reader = csv.DictReader(cf)
+        for row in reader:
+            if not row.get("card_id") or not row.get("feature_name") or not row.get("pubmed_query"):
+                print(f"[warn] Skipping row with missing required fields: {row}")
+                continue
+            build_card(cards_rows, studies_rows, seen, row)
+            time.sleep(0.2)
 
-# ---- write CSVs ----------------------------------------------------------
-with open("evidence_cards.csv","w",newline="",encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=list(cards_rows[0].keys()))
-    w.writeheader(); w.writerows(cards_rows)
+    if cards_rows:
+        with open("evidence_cards.csv","w",newline="",encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(cards_rows[0].keys()))
+            w.writeheader(); w.writerows(cards_rows)
+    else:
+        print("No cards produced; check your cards_config.csv")
 
-stud_fields = ["card_id","study_id","study_type","title","year","doi_or_link","design","n","follow_up_years",
-               "effect_measure","effect_value","ci_lower","ci_upper","funding","risk_of_bias_tool",
-               "risk_of_bias_overall","source_api","notes","oa_pdf"]
-with open("evidence_studies.csv","w",newline="",encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=stud_fields)
-    w.writeheader(); w.writerows(studies_rows)
+    if studies_rows:
+        stud_fields = ["card_id","study_id","study_type","title","year","doi_or_link","design","n","follow_up_years",
+                       "effect_measure","effect_value","ci_lower","ci_upper","funding","risk_of_bias_tool",
+                       "risk_of_bias_overall","source_api","notes","oa_pdf"]
+        with open("evidence_studies.csv","w",newline="",encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=stud_fields)
+            w.writeheader(); w.writerows(studies_rows)
+    else:
+        print("No studies found for any card.")
 
-print("Done. Created evidence_cards.csv and evidence_studies.csv")
+    print("Wrote evidence_cards.csv and evidence_studies.csv")
+
+if __name__ == "__main__":
+    main()
