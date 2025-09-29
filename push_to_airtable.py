@@ -5,6 +5,15 @@ TOKEN = os.environ["AIRTABLE_TOKEN"]
 TABLE_CARDS = os.environ["AIRTABLE_TABLE_CARDS"]      # e.g., "Cards" or "tblXXXX"
 TABLE_STUDIES = os.environ["AIRTABLE_TABLE_STUDIES"]  # e.g., "Studies" or "tblYYYY"
 
+missing = [k for k,v in {
+    "AIRTABLE_BASE_ID": BASE_ID,
+    "AIRTABLE_TOKEN": TOKEN,
+    "AIRTABLE_TABLE_CARDS": TABLE_CARDS,
+    "AIRTABLE_TABLE_STUDIES": TABLE_STUDIES
+}.items() if not v]
+if missing:
+    sys.exit(f"Missing required env vars: {', '.join(missing)}")
+    
 API = "https://api.airtable.com/v0"
 HEADERS = {"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"}
 
