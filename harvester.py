@@ -1,8 +1,9 @@
-# harvester.py (resilient)
+# harvester.py — multi-card (stemless + metal-backed)
 import csv, datetime, requests
 
-EMAIL = "kam.l.corcoran@gmail.com"
+EMAIL = "kam.l.corcoran@gmail.com"   # Unpaywall needs a real email
 
+# ---- HTTP helper ---------------------------------------------------------
 def safe_get(url, params=None, timeout=30):
     try:
         r = requests.get(url, params=params, timeout=timeout)
@@ -12,6 +13,7 @@ def safe_get(url, params=None, timeout=30):
         print(f"[warn] GET failed: {url}  ({e})")
         return None
 
+# ---- APIs ----------------------------------------------------------------
 def pubmed_search(term, retmax=50):
     r = safe_get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                  {"db":"pubmed","term":term,"retmode":"json","retmax":retmax})
@@ -71,17 +73,10 @@ def unpaywall_pdf(doi, email):
     best = data.get("best_oa_location") or {}
     return best.get("url_for_pdf","") or best.get("url","") or ""
 
-# ---- your first target (primary aTSA, stemless) ----
-FEATURE = "Stemless humeral component (aTSA)"
-OUTCOME = "5yr_all_cause_revision"
-QUERY = '(stemless[Title/Abstract]) AND ("total shoulder arthroplasty"[Title/Abstract]) AND (revision OR survivorship)'
+# ---- rows + builder ------------------------------------------------------
 today = datetime.date.today().isoformat()
+studies_rows, cards_rows, seen = [], [], set()
 
-pmids = pubmed_search(QUERY, retmax=50)
-pm = pubmed_summary(pmids)
-oa = openalex_reviews('stemless anatomic total shoulder arthroplasty revision', since="2018-01-01")
-
-studies_rows, seen = [], set()
 def add_row(card_id, study_type, title, year, doi, link, note):
     key = (doi or "", link or "", title or "")
     if key in seen: return
@@ -110,29 +105,90 @@ def add_row(card_id, study_type, title, year, doi, link, note):
         "oa_pdf": pdf
     })
 
-CARD_ID = "card_stemless_any_5yr"
-for r in oa:
-    add_row(CARD_ID, "systematic_review_or_meta_analysis", r["title"], r["year"], r["doi"], r["link"],
-            "SR/MA candidate (PRISMA/AMSTAR-2 to assess).")
-for s in pm:
-    add_row(CARD_ID, "primary_study", s["title"], s["year"], s["doi"], s["link"],
-            "Candidate RCT/cohort; classify later (RoB 2 / ROBINS-I).")
+def build_card(feature_name, outcome, comparator, pubmed_query, openalex_query, card_id,
+               bottom_line, certainty, registry_njr, registry_aoanjrr, registry_ajrr):
+    # search & collect
+    pmids = pubmed_search(pubmed_query, retmax=50)
+    pm = pubmed_summary(pmids)
+    oa = openalex_reviews(openalex_query, since="2018-01-01")
 
-cards_rows = [{
-    "card_id": CARD_ID,
-    "entity_type": "feature",
-    "entity_name": FEATURE,
-    "outcome": OUTCOME,
-    "comparator": "Stemmed aTSA",
-    "bottom_line": "Across SR/MA, one RCT, and adjusted registry analyses, stemless shows ~comparable 5-yr revision vs stemmed; caution with metal-backed glenoids.",
-    "certainty": "moderate",
-    "registry_njr": "n/a or limited shoulder coverage",
-    "registry_aoanjrr": "No HTARR with all-poly glenoids; higher risk signals with metal-backed glenoids.",
-    "registry_ajrr": "Survivorship trends comparable; see Annual Report.",
-    "last_updated": today,
-    "tags": "shoulder;TSA;stemless"
-}]
+    for r in oa:
+        add_row(card_id, "systematic_review_or_meta_analysis", r["title"], r["year"], r["doi"], r["link"],
+                "SR/MA candidate (PRISMA/AMSTAR-2 to assess).")
+    for s in pm:
+        add_row(card_id, "primary_study", s["title"], s["year"], s["doi"], s["link"],
+                "Candidate RCT/cohort; classify later (RoB 2 / ROBINS-I).")
 
+    cards_rows.append({
+        "card_id": card_id,
+        "entity_type": "feature",
+        "entity_name": feature_name,
+        "outcome": outcome,
+        "comparator": comparator,
+        "bottom_line": bottom_line,
+        "certainty": certainty,
+        "registry_njr": registry_njr,
+        "registry_aoanjrr": registry_aoanjrr,
+        "registry_ajrr": registry_ajrr,
+        "last_updated": today,
+        "tags": "shoulder;TSA"
+    })
+
+# ---- CARD 1: Stemless humeral component (existing) -----------------------
+build_card(
+    feature_name="Stemless humeral component (aTSA)",
+    outcome="5yr_all_cause_revision",
+    comparator="Stemmed aTSA",
+    pubmed_query='(stemless[Title/Abstract]) AND ("total shoulder arthroplasty"[Title/Abstract]) AND (revision OR survivorship)',
+    openalex_query='stemless anatomic total shoulder arthroplasty revision',
+    card_id="card_stemless_any_5yr",
+    bottom_line="Across SR/MA, one RCT, and adjusted registry analyses, stemless shows ~comparable 5-yr revision vs stemmed; signals confounded when metal-backed glenoids are included.",
+    certainty="moderate",
+    registry_njr="limited shoulder coverage",
+    registry_aoanjrr="Comparable stemless vs stemmed after excluding metal-backed glenoids.",
+    registry_ajrr="Survivorship broadly comparable; see Annual Report."
+)
+
+# ---- CARD 2: Metal-backed glenoid (aTSA) ---------------------------------
+build_card(
+    feature_name="Metal-backed glenoid (aTSA)",
+    outcome="5yr_all_cause_revision",
+    comparator="Cemented all-polyethylene glenoid (aTSA)",
+    pubmed_query='(("metal-backed"[Title/Abstract]) OR ("metal backed"[Title/Abstract]) OR ("trabecular metal"[Title/Abstract])) AND (("total shoulder arthroplasty"[Title/Abstract]) OR ("anatomic shoulder arthroplasty"[Title/Abstract])) AND (revision OR survivorship OR failure) NOT (reverse[Title/Abstract])',
+    openalex_query='metal-backed glenoid anatomic total shoulder arthroplasty revision',
+    card_id="card_metalbacked_any_5yr",
+    bottom_line="SR/MA and registries show higher revision/failure with metal-backed glenoids vs cemented all-poly in aTSA; mid-term RCTs of modern MBG show no clear superiority. Prefer cemented all-poly for routine aTSA; use MBG with caution.",
+    certainty="moderate",
+    registry_njr="limited shoulder reporting",
+    registry_aoanjrr="Registry collaboration shows higher revision when MBG used; excluding MBG equalizes stemless vs stemmed.",
+    registry_ajrr="Narrative caution around MBG in annual reports; confirm per latest edition."
+)
+
+# ---- CARD 3: Cemented all-polyethylene glenoid (aTSA) --------------------
+build_card(
+    feature_name="Cemented all-polyethylene glenoid (aTSA)",
+    outcome="5yr_all_cause_revision",
+    comparator="Metal-backed glenoid (aTSA)",
+    pubmed_query=(
+        '(("all polyethylene"[Title/Abstract]) OR ("all-polyethylene"[Title/Abstract]) '
+        'OR ("polyethylene glenoid"[Title/Abstract])) AND '
+        '(("total shoulder arthroplasty"[Title/Abstract]) OR ("anatomic shoulder arthroplasty"[Title/Abstract])) '
+        'AND (revision OR survivorship OR failure) NOT (reverse[Title/Abstract])'
+    ),
+    openalex_query='all polyethylene glenoid anatomic total shoulder arthroplasty revision',
+    card_id="card_allpoly_any_5yr",
+    bottom_line=(
+        "Cemented all-poly glenoids remain the reference option for aTSA with favorable mid-term survivorship. "
+        "Multiple SR/registry analyses report higher revision/failure with metal-backed glenoids; "
+        "modern TM-backed RCTs show no superiority at 5 years. Prefer cemented all-poly for routine aTSA."
+    ),
+    certainty="moderate",
+    registry_njr="limited shoulder reporting",
+    registry_aoanjrr="Registry collaboration indicates higher revision when metal-backed glenoids are used; all-poly performs best.",
+    registry_ajrr="Annual report narratives caution on MBG; all-poly cemented widely used."
+)
+
+# ---- write CSVs ----------------------------------------------------------
 with open("evidence_cards.csv","w",newline="",encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=list(cards_rows[0].keys()))
     w.writeheader(); w.writerows(cards_rows)
