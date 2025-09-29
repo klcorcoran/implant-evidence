@@ -67,6 +67,26 @@ def main():
 
     print("Airtable push complete.")
 
+# Build card_id -> recordId map from Cards
+cards_idx = {}
+for rec in list_records(TABLE_CARDS, fields=["card_id"]):
+    cid = (rec["fields"].get("card_id") or "").strip()
+    if cid: cards_idx[cid] = rec["id"]
+
+# Link Studies.Card based on card_id text
+to_link = []
+for rec in list_records(TABLE_STUDIES, fields=["study_id","card_id","Card"]):
+    cid = (rec["fields"].get("card_id") or "").strip()
+    if not cid or cid not in cards_idx: continue
+    # Skip if already linked
+    if rec["fields"].get("Card"): continue
+    to_link.append({"id": rec["id"], "fields": {"Card": [{"id": cards_idx[cid]}]}})
+
+if to_link:
+    batch_update(TABLE_STUDIES, to_link)
+    print(f"Linked {len(to_link)} studies to cards.")
+
+
 if __name__ == "__main__":
     main()
 def dedupe_by_key(rows, key):
@@ -107,3 +127,27 @@ if os.getenv("AIRTABLE_TRUNCATE","").lower() == "true":
     print("Truncating Airtable tables (dev mode)…")
     delete_records(TABLE_STUDIES, list_record_ids(TABLE_STUDIES))
     delete_records(TABLE_CARDS, list_record_ids(TABLE_CARDS))
+
+def list_records(table, fields=None, page_size=100):
+    url = f"{API}/{BASE_ID}/{table}"
+    params = {"pageSize": page_size}
+    if fields: params["fields[]"] = fields
+    out, offset = [], None
+    while True:
+        if offset: params["offset"] = offset
+        r = requests.get(url, headers=HEADERS, params=params); r.raise_for_status()
+        j = r.json()
+        out.extend(j.get("records", []))
+        offset = j.get("offset")
+        if not offset: break
+    return out
+
+def batch_update(table, recs):
+    url = f"{API}/{BASE_ID}/{table}"
+    for i in range(0, len(recs), 10):  # Airtable limit: 10 per request
+        chunk = {"records": recs[i:i+10]}
+        r = requests.patch(url, headers=HEADERS, data=json.dumps(chunk))
+        if r.status_code == 429: time.sleep(30); r = requests.patch(url, headers=HEADERS, data=json.dumps(chunk))
+        if r.status_code >= 300: raise SystemExit(f"Airtable link update error {r.status_code}: {r.text}")
+        time.sleep(0.35)  # ~5 req/sec per base
+
