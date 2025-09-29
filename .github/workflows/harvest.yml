@@ -34,3 +34,11 @@ jobs:
           git add evidence_cards.csv evidence_studies.csv || true
           git commit -m "auto: refresh evidence CSVs" || echo "no changes"
           git push
+  # NEW: push CSV rows into Airtable via API upsert
+      - name: Push to Airtable
+        env:
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_CARDS: ${{ secrets.AIRTABLE_TABLE_CARDS }}
+          AIRTABLE_TABLE_STUDIES: ${{ secrets.AIRTABLE_TABLE_STUDIES }}
+        run: python push_to_airtable.py
