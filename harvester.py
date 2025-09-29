@@ -1,7 +1,7 @@
 # harvester.py — config-driven evidence harvester (PubMed + OpenAlex + Crossref + Unpaywall)
 import csv, datetime, time, requests, sys, os
 
-EMAIL = os.getenv("HARVESTER_CONTACT_EMAIL", "your_email@example.com")  # set to a real email for Unpaywall
+EMAIL = os.getenv("HARVESTER_CONTACT_EMAIL", "kam.l.corcoran@gmail.com")  # set to a real email for Unpaywall
 OPENALEX_SINCE = os.getenv("OPENALEX_SINCE", "2018-01-01")
 PUBMED_RETMAX = int(os.getenv("PUBMED_RETMAX", "50"))
 USER_AGENT = "implant-evidence-harvester/1.0 (+https://example.com; contact=" + EMAIL + ")"
