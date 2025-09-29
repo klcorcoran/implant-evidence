@@ -1,13 +1,13 @@
-# harvester.py — config-driven evidence harvester (PubMed + OpenAlex + Crossref + Unpaywall)
+# harvester.py — config-driven (PubMed + OpenAlex + Crossref + Unpaywall) with SR/MA boost
 import csv, datetime, time, requests, sys, os
 
-EMAIL = os.getenv("HARVESTER_CONTACT_EMAIL", "kam.l.corcoran@gmail.com")  # set to a real email for Unpaywall
+EMAIL = os.getenv("HARVESTER_CONTACT_EMAIL", "kam.l.corcoran@gmail.com")  # real email for Unpaywall
 OPENALEX_SINCE = os.getenv("OPENALEX_SINCE", "2018-01-01")
 PUBMED_RETMAX = int(os.getenv("PUBMED_RETMAX", "50"))
-USER_AGENT = "implant-evidence-harvester/1.0 (+https://example.com; contact=" + EMAIL + ")"
-
+USER_AGENT = "implant-evidence-harvester/1.1 (+https://example.com; contact=" + EMAIL + ")"
 HEADERS = {"User-Agent": USER_AGENT}
 
+# ---------- HTTP ----------
 def safe_get(url, params=None, timeout=30):
     try:
         r = requests.get(url, params=params, headers=HEADERS, timeout=timeout)
@@ -17,12 +17,15 @@ def safe_get(url, params=None, timeout=30):
         print(f"[warn] GET failed: {url} ({e})")
         return None
 
+# ---------- PubMed (NCBI E-utilities) ----------
 def pubmed_search(term, retmax=50):
+    # ESearch returns PMIDs for a query
     r = safe_get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
                  {"db":"pubmed","term":term,"retmode":"json","retmax":retmax})
     return (r.json().get("esearchresult",{}).get("idlist",[]) if r else [])
 
 def pubmed_summary(pmids):
+    # ESummary returns brief metadata per PMID
     if not pmids: return []
     r = safe_get("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
                  {"db":"pubmed","id":",".join(pmids),"retmode":"json"})
@@ -35,9 +38,8 @@ def pubmed_summary(pmids):
         for a in rec.get("articleids",[]):
             if a.get("idtype")=="doi":
                 doi = a.get("value",""); break
-        year = ""
-        pubdate = rec.get("pubdate","")
-        if pubdate: year = pubdate[:4]
+        pubdate = rec.get("pubdate","") or ""
+        year = pubdate[:4] if pubdate else ""
         out.append({
             "pmid": pid,
             "title": rec.get("title",""),
@@ -47,13 +49,22 @@ def pubmed_summary(pmids):
         })
     return out
 
+# Boost: PubMed SR/MA so you don't miss reviews indexed in Medline
+def pubmed_systematic_reviews(term, retmax=50):
+    # (a) PubMed Systematic Review subset
+    q1 = f"({term}) AND systematic[sb]"
+    # (b) Publication type tags for meta-analysis / systematic review
+    q2 = f"({term}) AND (meta-analysis[Publication Type] OR systematic review[Publication Type])"
+    ids = list(dict.fromkeys(pubmed_search(q1, retmax) + pubmed_search(q2, retmax)))
+    return pubmed_summary(ids)
+
+# ---------- OpenAlex (works: type:review + since) ----------
 def openalex_reviews(query, since="2018-01-01", per_page=25):
     r = safe_get("https://api.openalex.org/works",
                  {"search": query, "filter": f"type:review,from_publication_date:{since}", "per_page": per_page})
     if not r: return []
     out=[]
-    j = r.json()
-    for w in j.get("results",[]):
+    for w in r.json().get("results",[]):
         doi = (w.get("doi") or "").replace("https://doi.org/","")
         out.append({
             "title": w.get("title",""),
@@ -63,6 +74,7 @@ def openalex_reviews(query, since="2018-01-01", per_page=25):
         })
     return out
 
+# ---------- Crossref + Unpaywall ----------
 def crossref_enrich(doi):
     if not doi: return {}
     r = safe_get(f"https://api.crossref.org/works/{doi}", timeout=20)
@@ -76,10 +88,10 @@ def unpaywall_pdf(doi, email):
     if not doi: return ""
     r = safe_get(f"https://api.unpaywall.org/v2/{doi}", params={"email": email}, timeout=20)
     if not r: return ""
-    data = r.json()
-    best = data.get("best_oa_location") or {}
+    best = (r.json() or {}).get("best_oa_location") or {}
     return best.get("url_for_pdf","") or best.get("url","") or ""
 
+# ---------- Row builders ----------
 def add_study_row(studies_rows, seen, card_id, study_type, title, year, doi, link, note, email):
     key = (doi or "", link or "", title or "", study_type or "", card_id or "")
     if key in seen: return
@@ -89,7 +101,7 @@ def add_study_row(studies_rows, seen, card_id, study_type, title, year, doi, lin
     studies_rows.append({
         "card_id": card_id,
         "study_id": f"doi:{doi}" if doi else f"url:{link}",
-        "study_type": study_type,
+        "study_type": study_type,  # "systematic_review_or_meta_analysis" or "primary_study"
         "title": title or "",
         "year": year or "",
         "doi_or_link": (f"https://doi.org/{doi}" if doi else (link or "")),
@@ -109,22 +121,34 @@ def add_study_row(studies_rows, seen, card_id, study_type, title, year, doi, lin
     })
 
 def build_card(cards_rows, studies_rows, seen, cfg_row):
-    pmids = pubmed_search(cfg_row["pubmed_query"], retmax=PUBMED_RETMAX)
-    pm = pubmed_summary(pmids)
-    oa = openalex_reviews(cfg_row["openalex_query"], since=OPENALEX_SINCE)
-
+    term = cfg_row["pubmed_query"]
     card_id = cfg_row["card_id"]
+
+    # SR/MA from OpenAlex + PubMed (systematic subset + publication types)
+    oa = openalex_reviews(cfg_row["openalex_query"], since=OPENALEX_SINCE)
+    sr = pubmed_systematic_reviews(term, retmax=PUBMED_RETMAX)
+
     for r in oa:
         add_study_row(studies_rows, seen, card_id, "systematic_review_or_meta_analysis",
                       r["title"], r["year"], r["doi"], r["link"],
                       "SR/MA candidate (screen with PRISMA/AMSTAR-2).", EMAIL)
-    for s in pm:
+    for s in sr:
+        add_study_row(studies_rows, seen, card_id, "systematic_review_or_meta_analysis",
+                      s["title"], s["year"], s["doi"], s["link"],
+                      "SR/MA from PubMed systematic subset / publication type.", EMAIL)
+
+    # Primary studies (broad)
+    pmids = pubmed_search(term, retmax=PUBMED_RETMAX)
+    for s in pubmed_summary(pmids):
         add_study_row(studies_rows, seen, card_id, "primary_study",
                       s["title"], s["year"], s["doi"], s["link"],
                       "Candidate RCT/cohort; classify later (RoB 2 / ROBINS-I).", EMAIL)
 
+    # Card row (now includes joint, procedure)
     cards_rows.append({
         "card_id": card_id,
+        "joint": cfg_row.get("joint",""),
+        "procedure": cfg_row.get("procedure",""),
         "entity_type": "feature",
         "entity_name": cfg_row["feature_name"],
         "outcome": cfg_row["outcome"],
@@ -141,35 +165,30 @@ def build_card(cards_rows, studies_rows, seen, cfg_row):
 def main():
     cfg_path = "cards_config.csv"
     if not os.path.exists(cfg_path):
-        print("Missing cards_config.csv in repo root. Create it and rerun."); sys.exit(1)
+        print("Missing cards_config.csv in repo root."); sys.exit(1)
 
     cards_rows, studies_rows, seen = [], [], set()
 
     with open(cfg_path, newline="", encoding="utf-8") as cf:
-        reader = csv.DictReader(cf)
-        for row in reader:
-            if not row.get("card_id") or not row.get("feature_name") or not row.get("pubmed_query"):
-                print(f"[warn] Skipping row with missing required fields: {row}")
-                continue
+        for row in csv.DictReader(cf):
+            required = ["card_id","feature_name","pubmed_query"]
+            if any(not row.get(k) for k in required):
+                print(f"[warn] Skipping row (missing required fields): {row}"); continue
             build_card(cards_rows, studies_rows, seen, row)
-            time.sleep(0.2)
+            time.sleep(0.2)  # be polite
 
     if cards_rows:
         with open("evidence_cards.csv","w",newline="",encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(cards_rows[0].keys()))
             w.writeheader(); w.writerows(cards_rows)
-    else:
-        print("No cards produced; check your cards_config.csv")
 
     if studies_rows:
-        stud_fields = ["card_id","study_id","study_type","title","year","doi_or_link","design","n","follow_up_years",
-                       "effect_measure","effect_value","ci_lower","ci_upper","funding","risk_of_bias_tool",
-                       "risk_of_bias_overall","source_api","notes","oa_pdf"]
+        fields = ["card_id","study_id","study_type","title","year","doi_or_link","design","n","follow_up_years",
+                  "effect_measure","effect_value","ci_lower","ci_upper","funding","risk_of_bias_tool",
+                  "risk_of_bias_overall","source_api","notes","oa_pdf"]
         with open("evidence_studies.csv","w",newline="",encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=stud_fields)
+            w = csv.DictWriter(f, fieldnames=fields)
             w.writeheader(); w.writerows(studies_rows)
-    else:
-        print("No studies found for any card.")
 
     print("Wrote evidence_cards.csv and evidence_studies.csv")
 
